@@ -26,12 +26,11 @@ BIT mostly mean setuid, setgid, or sticky bit
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <sys/mman.h>
 #include <string.h>
 
 #define ENGINE_UPDATE_INTERVAL_IN_SECOND 1 // in second
 
-// TMPFS path (same as engine)
+// File path where engine writes data
 #define ENGINE_BIZS_FILE_PATH "./data/trade_data.bin"
 
 // --------------------------------------------------------- //
@@ -121,83 +120,40 @@ void signal_handler(int signum) {
 
 class EngineConsumer_c {
     FileBizsData_t _file_data;  // local copy of last read data
-    
-    // File descriptor dan mapped data disimpan sebagai lokal di method, bukan member
-    // karena tidak perlu persistent antar pemanggilan
-    
+
     void _clear_screen_lines(int n_lines) {
         for (int i = 0; i < n_lines; i++) {
             std::cout << "\033[A\033[2K";
         }
     }
-    
-    // Method 1: Baca dengan read() biasa (simple)
-    bool _read_file_read() {
+
+    bool _read_file() {
         int fd = open(ENGINE_BIZS_FILE_PATH, O_RDONLY);
         if (fd == -1) {
             return false;  // file not yet created
         }
-        
+
         FileBizsData_t tmp;
         ssize_t n = read(fd, &tmp, sizeof(tmp));
         close(fd);
-        
+
         if (n != sizeof(tmp)) {
             return false;  // incomplete read
         }
-        
+
         _file_data = tmp;
-        return true;
-    }
-    
-    // Method 2: Baca dengan mmap (lebih cepat untuk akses berulang)
-    bool _read_file_mmap() {
-        int fd = open(ENGINE_BIZS_FILE_PATH, O_RDONLY);
-        if (fd == -1) {
-            return false;
-        }
-        
-        struct stat st;
-        if (fstat(fd, &st) != 0) {
-            close(fd);
-            return false;
-        }
-        
-        if (st.st_size != sizeof(FileBizsData_t)) {
-            close(fd);
-            return false;
-        }
-        
-        void* mapped_data = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-        if (mapped_data == MAP_FAILED) {
-            close(fd);
-            return false;
-        }
-        
-        // Copy dari mapped memory ke local struct
-        memcpy(&_file_data, mapped_data, sizeof(_file_data));
-        
-        munmap(mapped_data, st.st_size);
-        close(fd);
-        
         return true;
     }
 
     void _update_display() {
-        // Coba baca dengan mmap dulu, fallback ke read biasa
-        bool read_ok = _read_file_mmap();
-        if (!read_ok) {
-            read_ok = _read_file_read();
-        }
-        
-        if (!read_ok) {
-            std::cout << "NOTE: no data available yet (waiting for engine)\r" << std::flush;
+        if (!_read_file()) {
+            std::cout << "NOTE: no data available yet (waiting for engine)\n";
             return;
         }
 
         int current_count = _file_data.count;
         if (current_count <= 0) {
-            std::cout << "NOTE: no biz data available\r" << std::flush;
+            std::cout << "NOTE: no biz data available\n";
             return;
         }
 
@@ -215,7 +171,7 @@ class EngineConsumer_c {
             first_run = false;
         }
 
-        std::cout << "\nTIME                : " << timestamp() << "\n";
+        std::cout << "TIME                : " << timestamp() << "\n";
 
         for (int i = 0; i < current_count; i++) {
             const auto& biz = _file_data.bizs[i];
@@ -233,41 +189,19 @@ class EngineConsumer_c {
     }
 
 public:
-    EngineConsumer_c() : _file_data{} {
-        // Default constructor, tidak perlu inisialisasi member lain
-    }
+    EngineConsumer_c() : _file_data{} {}
 
     bool initialize() {
-        // Cek apakah direktori data ada
-        struct stat st;
-        if (stat("./data", &st) == 0 && S_ISDIR(st.st_mode)) {
-            std::cout << "INFO: data directory exists\n";
-            
-            // Cek apakah file sudah ada
-            if (stat(ENGINE_BIZS_FILE_PATH, &st) == 0) {
-                std::cout << "INFO: Data file found, size: " << st.st_size << " bytes\n";
-            } else {
-                std::cout << "INFO: Waiting for engine to create data file...\n";
-            }
-        } else {
-            std::cout << "WARN: data directory not found, creating...\n";
-            mkdir("./data", 0755);  // Buat direktori data jika belum ada
-        }
-        
+        // Nothing special to initialize, file will be opened on each read
         return true;
     }
 
     void run() {
-        std::cout << "\033[2J\033[1;1H";  // clear screen
-        std::cout << "Consumer running. Press Ctrl+C to stop.\n";
-        
         while (_consumer_is_running) {
             _update_display();
             std::this_thread::sleep_for(
                 std::chrono::seconds(ENGINE_UPDATE_INTERVAL_IN_SECOND));
         }
-        
-        std::cout << "\nConsumer stopped.\n";
     }
 };
 
@@ -276,8 +210,7 @@ public:
 
 int main() {
     std::signal(SIGINT, signal_handler);
-    std::cout << "RUN: trading_sys - trader_consumer (TMPFS version)\n";
-    std::cout << "==================================================\n";
+    std::cout << "RUN: trading_sys - trader_consumer (file-based I/O)\n";
 
     EngineConsumer_c consumer;
     if (!consumer.initialize()) {
