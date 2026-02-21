@@ -28,7 +28,6 @@ BIT mostly mean setuid, setgid, or sticky bit
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <string.h>
-#include <errno.h>
 
 #define ENGINE_UPDATE_INTERVAL_IN_SECOND 1 // in second
 
@@ -122,10 +121,9 @@ void signal_handler(int signum) {
 
 class EngineConsumer_c {
     FileBizsData_t _file_data;  // local copy of last read data
-    int _fd;                     // file descriptor untuk mmap (optional)
-    void* _mapped_data;          // untuk mmap mode
     
-    bool _use_mmap;              // pake mmap atau read biasa?
+    // File descriptor dan mapped data disimpan sebagai lokal di method, bukan member
+    // karena tidak perlu persistent antar pemanggilan
     
     void _clear_screen_lines(int n_lines) {
         for (int i = 0; i < n_lines; i++) {
@@ -154,33 +152,33 @@ class EngineConsumer_c {
     
     // Method 2: Baca dengan mmap (lebih cepat untuk akses berulang)
     bool _read_file_mmap() {
-        _fd = open(ENGINE_BIZS_FILE_PATH, O_RDONLY);
-        if (_fd == -1) {
+        int fd = open(ENGINE_BIZS_FILE_PATH, O_RDONLY);
+        if (fd == -1) {
             return false;
         }
         
         struct stat st;
-        if (fstat(_fd, &st) != 0) {
-            close(_fd);
+        if (fstat(fd, &st) != 0) {
+            close(fd);
             return false;
         }
         
         if (st.st_size != sizeof(FileBizsData_t)) {
-            close(_fd);
+            close(fd);
             return false;
         }
         
-        _mapped_data = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, _fd, 0);
-        if (_mapped_data == MAP_FAILED) {
-            close(_fd);
+        void* mapped_data = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+        if (mapped_data == MAP_FAILED) {
+            close(fd);
             return false;
         }
         
         // Copy dari mapped memory ke local struct
-        memcpy(&_file_data, _mapped_data, sizeof(_file_data));
+        memcpy(&_file_data, mapped_data, sizeof(_file_data));
         
-        munmap(_mapped_data, st.st_size);
-        close(_fd);
+        munmap(mapped_data, st.st_size);
+        close(fd);
         
         return true;
     }
@@ -235,13 +233,15 @@ class EngineConsumer_c {
     }
 
 public:
-    EngineConsumer_c() : _file_data{}, _fd(-1), _mapped_data(nullptr), _use_mmap(true) {}
+    EngineConsumer_c() : _file_data{} {
+        // Default constructor, tidak perlu inisialisasi member lain
+    }
 
     bool initialize() {
-        // Cek apakah /dev/shm ada
+        // Cek apakah direktori data ada
         struct stat st;
-        if (stat("/dev/shm", &st) == 0) {
-            std::cout << "INFO: tmpfs detected at /dev/shm\n";
+        if (stat("./data", &st) == 0 && S_ISDIR(st.st_mode)) {
+            std::cout << "INFO: data directory exists\n";
             
             // Cek apakah file sudah ada
             if (stat(ENGINE_BIZS_FILE_PATH, &st) == 0) {
@@ -250,7 +250,8 @@ public:
                 std::cout << "INFO: Waiting for engine to create data file...\n";
             }
         } else {
-            std::cout << "WARN: /dev/shm not found, falling back to disk I/O\n";
+            std::cout << "WARN: data directory not found, creating...\n";
+            mkdir("./data", 0755);  // Buat direktori data jika belum ada
         }
         
         return true;
