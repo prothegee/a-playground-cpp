@@ -38,6 +38,8 @@ common_check.*
 
 *.cc.o
 
+/data/trade_data*
+
 ##
 ## file: exclude
 ##
