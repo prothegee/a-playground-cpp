@@ -16,24 +16,24 @@ BIT mostly mean setuid, setgid, or sticky bit
 
 #include <iostream>
 #include <string>
-// #include <vector>
-// #include <utility>
 #include <random> 
 #include <sstream>
 #include <chrono>
 #include <iomanip>
 #include <atomic>
 #include <csignal>
-// #include <filesystem>
 #include <thread>
-
-#include <sys/mman.h>
+#include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
 #include <string.h>
+#include <errno.h>
 
 #define ENGINE_UPDATE_INTERVAL_IN_SECOND 1 // in second
 
-#define ENGINE_BIZS_SHARED_MEM_NAME "/shared_bizs_mem_data"
+// TMPFS path (same as engine)
+#define ENGINE_BIZS_FILE_PATH "./data/trade_data.bin"
 
 // --------------------------------------------------------- //
 
@@ -42,13 +42,11 @@ static std::default_random_engine _rande(_rand());
 
 int random_round_num(const int& min, const int& max) {
     std::uniform_int_distribution<int> eval(min, max);
-
     return eval(_rande);
 }
 
 double random_decimal_num(const double& min, const double& max) {
     std::uniform_real_distribution<double> eval(min, max);
-
     return eval(_rande);
 }
 
@@ -57,12 +55,10 @@ int find_and_replace_all(std::string& source,
                          const std::string& replacement) {
     try {
         size_t position = 0;
-
         while ((position = source.find(query, position)) != std::string::npos) {
             source.replace(position, query.size(), replacement);
             position += replacement.size();
         }
-
         return 1;
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
@@ -71,51 +67,42 @@ int find_and_replace_all(std::string& source,
 }
 
 std::string timestamp(const int& tz_offset = 0) {
-    int tz = tz_offset * 3600; // adjust with seconds hour
-    std::string s;
+    int tz = tz_offset * 3600;
     std::stringstream ss;
 
-    // utc timezone is from -12 to 14
     if (tz <= -12) { tz = -12; }
-    if (tz <= 14) { tz = 14; }
+    if (tz >= 14) { tz = 14; }
 
     auto now = std::chrono::system_clock::now();
-
-    std::time_t now_time = std::chrono::system_clock::to_time_t(
-            std::chrono::system_clock::now());
+    std::time_t now_time = std::chrono::system_clock::to_time_t(now);
     std::time_t now_time_utc = now_time + tz;
 
     tm tm_buf;
-
-    gmtime_r(&now_time_utc, &tm_buf); // unix compatible
+    gmtime_r(&now_time_utc, &tm_buf);
 
     auto now_ns = std::chrono::time_point_cast<std::chrono::nanoseconds>(now);
     auto nanoseconds = now_ns.time_since_epoch() % std::chrono::seconds(1);
 
     ss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S") << '.' << std::setw(9)
-           << std::setfill('0') << nanoseconds.count();
-
+       << std::setfill('0') << nanoseconds.count();
     return ss.str();
 }
 
 // --------------------------------------------------------- //
-// --------------------------------------------------------- //
+// Data structures must match those used by engine
+constexpr int _MAX_BIZ_SIZE = 32;
 
-// @note this is shared per data object
-typedef struct _SharedBizData_t {
+struct FileBizData_t {
     int id;
     char name[512];
     double current_stock;
     double total_stock;
-} SharedBizData_t;
+};
 
-constexpr int _MAX_BIZ_SIZE = 32;
-// @note array/vector data from SharedBizData_t
-typedef struct _SharedBizsData_t {
-    std::atomic<int> count;
-    SharedBizData_t bizs[_MAX_BIZ_SIZE]; // some alocated memory need to be initialize at compile time
-} SharedBizsData_t;
-// typedef std::vector<SharedBizData_t> SharedBizsData_t;
+struct FileBizsData_t {
+    int count;
+    FileBizData_t bizs[_MAX_BIZ_SIZE];
+};
 
 // --------------------------------------------------------- //
 // --------------------------------------------------------- //
@@ -123,9 +110,9 @@ typedef struct _SharedBizsData_t {
 static std::atomic<bool> _consumer_is_running(true);
 
 void signal_handler(int signum) {
-    if (signum == 2) { // ctrl+c
+    if (signum == 2) { // Ctrl+C
         std::cout << "\nSIG " << signum << ": shutting down gracefully at "
-                  << timestamp() << "\n"; // maybe log exit time for record
+                  << timestamp() << "\n";
         _consumer_is_running = false;
     }
 }
@@ -134,40 +121,95 @@ void signal_handler(int signum) {
 // --------------------------------------------------------- //
 
 class EngineConsumer_c {
-    // file descriptor
-    int _fd;
-    size_t _fd_size;
-    void* _mapped = MAP_FAILED;
-    SharedBizsData_t* _p_shared_bizs_data;
-
-    // --------------------------------------------------------- //
-
+    FileBizsData_t _file_data;  // local copy of last read data
+    int _fd;                     // file descriptor untuk mmap (optional)
+    void* _mapped_data;          // untuk mmap mode
+    
+    bool _use_mmap;              // pake mmap atau read biasa?
+    
     void _clear_screen_lines(int n_lines) {
         for (int i = 0; i < n_lines; i++) {
-            // clear entire line, move up one line
             std::cout << "\033[A\033[2K";
         }
     }
+    
+    // Method 1: Baca dengan read() biasa (simple)
+    bool _read_file_read() {
+        int fd = open(ENGINE_BIZS_FILE_PATH, O_RDONLY);
+        if (fd == -1) {
+            return false;  // file not yet created
+        }
+        
+        FileBizsData_t tmp;
+        ssize_t n = read(fd, &tmp, sizeof(tmp));
+        close(fd);
+        
+        if (n != sizeof(tmp)) {
+            return false;  // incomplete read
+        }
+        
+        _file_data = tmp;
+        return true;
+    }
+    
+    // Method 2: Baca dengan mmap (lebih cepat untuk akses berulang)
+    bool _read_file_mmap() {
+        _fd = open(ENGINE_BIZS_FILE_PATH, O_RDONLY);
+        if (_fd == -1) {
+            return false;
+        }
+        
+        struct stat st;
+        if (fstat(_fd, &st) != 0) {
+            close(_fd);
+            return false;
+        }
+        
+        if (st.st_size != sizeof(FileBizsData_t)) {
+            close(_fd);
+            return false;
+        }
+        
+        _mapped_data = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, _fd, 0);
+        if (_mapped_data == MAP_FAILED) {
+            close(_fd);
+            return false;
+        }
+        
+        // Copy dari mapped memory ke local struct
+        memcpy(&_file_data, _mapped_data, sizeof(_file_data));
+        
+        munmap(_mapped_data, st.st_size);
+        close(_fd);
+        
+        return true;
+    }
 
     void _update_display() {
-        if (!_p_shared_bizs_data) return;
-
-        int current_count = _p_shared_bizs_data->count.load();
-
-        if (current_count <= 0) {
-            std::cout << "NOTE: no biz data available";
+        // Coba baca dengan mmap dulu, fallback ke read biasa
+        bool read_ok = _read_file_mmap();
+        if (!read_ok) {
+            read_ok = _read_file_read();
+        }
+        
+        if (!read_ok) {
+            std::cout << "NOTE: no data available yet (waiting for engine)\r" << std::flush;
             return;
         }
 
-        int total_lines = 1; // header line
-        // calculate total lines needed for display
+        int current_count = _file_data.count;
+        if (current_count <= 0) {
+            std::cout << "NOTE: no biz data available\r" << std::flush;
+            return;
+        }
+
+        // Calculate total lines for clearing
+        int total_lines = 1; // header
         for (int i = 0; i < current_count; i++) {
             total_lines += 6;
         }
-        // final separator
-        total_lines += 1;
+        total_lines += 1; // final separator
 
-        // clear previous output, except first run
         static bool first_run = true;
         if (!first_run) {
             _clear_screen_lines(total_lines);
@@ -175,97 +217,72 @@ class EngineConsumer_c {
             first_run = false;
         }
 
-        // header display
-        std::cout << "TIME                : " << timestamp() << "\n";
+        std::cout << "\nTIME                : " << timestamp() << "\n";
 
-        // biz display
         for (int i = 0; i < current_count; i++) {
-            const auto& biz = _p_shared_bizs_data->bizs[i];
+            const auto& biz = _file_data.bizs[i];
             std::cout << "#=================================================#\n";
             std::cout << "id                  : " << biz.id << "\n";
             std::cout << "name                : " << biz.name << "\n";
             std::cout << "total stock         : " << std::fixed << std::setprecision(2)
-                                                  << biz.total_stock << "\n";
+                      << biz.total_stock << "\n";
             std::cout << "current stock /share: " << std::fixed << std::setprecision(2)
-                                                  << biz.current_stock << "\n";
+                      << biz.current_stock << "\n";
             std::cout << "#-------------------------------------------------#\n";
         }
 
-        // immediate display
         std::cout.flush();
     }
 
 public:
-    EngineConsumer_c() : _fd(-1)
-                       , _fd_size(sizeof(SharedBizsData_t))
-                       , _mapped(MAP_FAILED)
-                       , _p_shared_bizs_data(nullptr) {};
-    ~EngineConsumer_c() {
-        if (_mapped != MAP_FAILED) {
-            munmap(_mapped, _fd_size);
-            _mapped = MAP_FAILED;
-            _p_shared_bizs_data = nullptr;
-        }
-    };
-
-    // --------------------------------------------------------- //
+    EngineConsumer_c() : _file_data{}, _fd(-1), _mapped_data(nullptr), _use_mmap(true) {}
 
     bool initialize() {
-        // TODO: open existing shared memory
-        _fd = shm_open(ENGINE_BIZS_SHARED_MEM_NAME, O_RDONLY, 0666);
-
-        if (_fd == -1) {
-            std::cerr << "ERROR: shm_open failed, check if main engine is running\n";
-            return false;
+        // Cek apakah /dev/shm ada
+        struct stat st;
+        if (stat("/dev/shm", &st) == 0) {
+            std::cout << "INFO: tmpfs detected at /dev/shm\n";
+            
+            // Cek apakah file sudah ada
+            if (stat(ENGINE_BIZS_FILE_PATH, &st) == 0) {
+                std::cout << "INFO: Data file found, size: " << st.st_size << " bytes\n";
+            } else {
+                std::cout << "INFO: Waiting for engine to create data file...\n";
+            }
+        } else {
+            std::cout << "WARN: /dev/shm not found, falling back to disk I/O\n";
         }
-
-        _mapped = mmap(nullptr, _fd_size, PROT_READ, MAP_SHARED, _fd, 0);
-        close(_fd);
-
-        if (_mapped == MAP_FAILED) {
-            std::cerr << "ERROR: mmap failed\n";
-            return false;
-        }
-
-        _p_shared_bizs_data = static_cast<SharedBizsData_t*>(_mapped);
-
+        
         return true;
     }
 
     void run() {
-        for (;;) {
+        std::cout << "\033[2J\033[1;1H";  // clear screen
+        std::cout << "Consumer running. Press Ctrl+C to stop.\n";
+        
+        while (_consumer_is_running) {
             _update_display();
-
-            // update for each 1 second
             std::this_thread::sleep_for(
-                std::chrono::seconds(ENGINE_UPDATE_INTERVAL_IN_SECOND)
-            );
-
-            // exit the consumer engine
-            if (!_consumer_is_running) { break; }
+                std::chrono::seconds(ENGINE_UPDATE_INTERVAL_IN_SECOND));
         }
+        
+        std::cout << "\nConsumer stopped.\n";
     }
-}; // EngineConsumer_c
+};
 
 // --------------------------------------------------------- //
 // --------------------------------------------------------- //
 
 int main() {
     std::signal(SIGINT, signal_handler);
-    std::cout << "RUN: trading_sys - trader_consumer\n";
+    std::cout << "RUN: trading_sys - trader_consumer (TMPFS version)\n";
+    std::cout << "==================================================\n";
 
-    // NOTE:
-    // don't call shm_unlink()
-    // unless you want to destroy that shared mem
-    EngineConsumer_c* p_consumer = new EngineConsumer_c();
-
-    if (!p_consumer->initialize()) {
+    EngineConsumer_c consumer;
+    if (!consumer.initialize()) {
         return -1;
     }
-
-    p_consumer->run();
-
-    delete p_consumer;
+    consumer.run();
 
     return 0;
 }
